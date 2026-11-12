@@ -12,6 +12,7 @@
 Quiet Mouse adds tap-to-click to the Apple Magic Mouse on macOS. A light tap is enough — you don't have to press the mouse down — so clicks stay quiet. Scrolling and gestures are unchanged.
 
 网站 / Website: https://quietmouse.org
+个人主页 / Personal home: https://danielye2011.uk
 
 ## 功能
 

@@ -1,0 +1,8 @@
+.DS_Store
+__MACOSX
+QuietMouse.app
+*.dSYM
+xcuserdata/
+.idea/
+*.zip
+*.dmg

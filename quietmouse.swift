@@ -20,12 +20,15 @@ let maxTouchTravel: Float = 0.05 // normalized surface units the finger may drif
 let maxCursorTravel: CGFloat = 5 // points the pointer may move during the tap
 let physicalClickGrace = 0.12    // a physical press this long before the touch cancels the tap
 let clickDebounce = 0.05         // ignore taps this soon after a synthesized click
+let holdDelay = 0.4              // seconds a finger must rest still before it counts as press-and-hold
+let holdStartTravel: CGFloat = 3 // points the pointer must move after a hold before the drag begins
 let selfMarker: Int64 = 0x514D   // tags events we post so we do not mistake them for physical ones
 
 let args = Set(CommandLine.arguments.dropFirst())
 let debug = args.contains("--debug")
 let flip = args.contains("--flip")
 var tapEnabled = true
+var holdEnabled = true
 
 func log(_ s: @autoclosure () -> String) {
     if debug { print(s()); fflush(stdout) }
@@ -103,15 +106,60 @@ var clickCount: Int64 = 0
 
 func now() -> Double { ProcessInfo.processInfo.systemUptime }
 
+// Press-and-hold state. Holding a finger still arms a drag; the drag starts on the next pointer
+// movement, so resting a finger without moving the mouse never clicks anything.
+var holdArmed = false
+var holdDragging = false
+var holdRight = false
+var holdAnchor = CGPoint.zero
+
+func postButton(down: Bool, right: Bool, at loc: CGPoint) {
+    let src = CGEventSource(stateID: .hidSystemState)
+    let type: CGEventType = right ? (down ? .rightMouseDown : .rightMouseUp) : (down ? .leftMouseDown : .leftMouseUp)
+    let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: loc, mouseButton: right ? .right : .left)
+    e?.setIntegerValueField(.eventSourceUserData, value: selfMarker)
+    e?.setIntegerValueField(.mouseEventClickState, value: 1)
+    e?.post(tap: .cghidEventTap)
+}
+
+func endDrag() {
+    stateLock.lock()
+    holdArmed = false
+    guard holdDragging else { stateLock.unlock(); return }
+    holdDragging = false
+    let right = holdRight
+    stateLock.unlock()
+    log("drag end")
+    postButton(down: false, right: right, at: CGEvent(source: nil)?.location ?? .zero)
+}
+
 let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         if let t = eventTap { CGEvent.tapEnable(tap: t, enable: true) }
         return Unmanaged.passUnretained(event)
     }
-    if event.getIntegerValueField(.eventSourceUserData) != selfMarker {
-        stateLock.lock(); lastPhysicalDown = now(); stateLock.unlock()
-        log("physical press")
+    if event.getIntegerValueField(.eventSourceUserData) == selfMarker { return Unmanaged.passUnretained(event) }
+
+    if type == .mouseMoved {
+        stateLock.lock()
+        let armed = holdArmed, dragging = holdDragging, right = holdRight, anchor = holdAnchor
+        stateLock.unlock()
+        if dragging {
+            // The OS sees our synthetic button as up, so turn plain moves into drags.
+            event.type = right ? .rightMouseDragged : .leftMouseDragged
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
+        } else if armed, hypot(event.location.x - anchor.x, event.location.y - anchor.y) > holdStartTravel {
+            stateLock.lock(); holdArmed = false; holdDragging = true; stateLock.unlock()
+            log("drag start (\(right ? "right" : "left"))")
+            postButton(down: true, right: right, at: anchor)
+            return nil // the next movement event carries on from the anchor as a drag
+        }
+        return Unmanaged.passUnretained(event)
     }
+
+    stateLock.lock(); lastPhysicalDown = now(); stateLock.unlock()
+    endDrag() // a real press takes over from any synthetic hold
+    log("physical press")
     return Unmanaged.passUnretained(event)
 }
 var eventTap: CFMachPort?
@@ -162,6 +210,8 @@ final class TapState {
     var startY: Float = 0
     var travel: Float = 0
     var cursorStart = CGPoint.zero
+    var drifted = false     // pointer moved too much for a hold
+    var holdHandled = false // this touch armed a hold, so it is not a tap
 }
 var states: [UnsafeMutableRawPointer: TapState] = [:]
 
@@ -188,6 +238,22 @@ func finishTap(_ st: TapState) {
     DispatchQueue.main.async { postClick(right: right) }
 }
 
+/// A finger that has rested still (finger and pointer) long enough arms a press-and-hold.
+func checkHold(_ st: TapState) {
+    let cursor = CGEvent(source: nil)?.location ?? .zero
+    if hypot(cursor.x - st.cursorStart.x, cursor.y - st.cursorStart.y) > maxCursorTravel { st.drifted = true }
+    let t = now()
+    guard !st.cancelled, !st.drifted, st.travel <= maxTouchTravel, t - st.startTime >= holdDelay else { return }
+    stateLock.lock(); let physical = lastPhysicalDown; stateLock.unlock()
+    st.holdHandled = true
+    guard physical < st.startTime - physicalClickGrace else { return }
+    var x = st.startX
+    if flip { x = 1 - x }
+    let right = x >= rightZoneStart()
+    stateLock.lock(); holdArmed = true; holdRight = right; holdAnchor = cursor; stateLock.unlock()
+    log("hold armed \(right ? "RIGHT" : "LEFT") — move the mouse to drag")
+}
+
 let contactCallback: MTContactCallback = { device, fingers, count, _, _ in
     guard let device = device else { return 0 }
     stateLock.lock()
@@ -208,7 +274,9 @@ let contactCallback: MTContactCallback = { device, fingers, count, _, _ in
     }
 
     if n == 0 {
-        if st.active { finishTap(st) }
+        if st.active {
+            if st.holdHandled { endDrag(); st.active = false; st.cancelled = false } else { finishTap(st) }
+        }
     } else if n == 1 && st.prevCount == 0 && !st.active {
         let f = touching[0]
         st.active = true
@@ -217,6 +285,8 @@ let contactCallback: MTContactCallback = { device, fingers, count, _, _ in
         st.startX = f.normalized.pos.x
         st.startY = f.normalized.pos.y
         st.travel = 0
+        st.drifted = false
+        st.holdHandled = false
         st.cursorStart = CGEvent(source: nil)?.location ?? .zero
     } else if n > 1 {
         if st.active { st.cancelled = true }
@@ -225,6 +295,7 @@ let contactCallback: MTContactCallback = { device, fingers, count, _, _ in
         let d = max(abs(f.normalized.pos.x - st.startX), abs(f.normalized.pos.y - st.startY))
         st.travel = max(st.travel, d)
     }
+    if n >= 1, st.active, !st.holdHandled, holdEnabled, tapEnabled { checkHold(st) }
     st.prevCount = n
     return 0
 }
@@ -265,8 +336,8 @@ func scanDevices() {
 func installEventTap() {
     guard eventTap == nil else { return }
     let mask: CGEventMask = (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
-        | (1 << CGEventType.otherMouseDown.rawValue)
-    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+        | (1 << CGEventType.otherMouseDown.rawValue) | (1 << CGEventType.mouseMoved.rawValue)
+    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                       eventsOfInterest: mask, callback: tapCallback, userInfo: nil) else { return }
     eventTap = tap
     CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
@@ -278,11 +349,13 @@ func installEventTap() {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let toggleItem = NSMenuItem(title: "Tap to Click", action: #selector(toggleTap), keyEquivalent: "")
+    let holdItem = NSMenuItem(title: "Hold to Drag", action: #selector(toggleHold), keyEquivalent: "")
     let loginItem = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
     let permItem = NSMenuItem(title: "Grant Permissions…", action: #selector(openPermissions), keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ note: Notification) {
         tapEnabled = UserDefaults.standard.object(forKey: "tapEnabled") as? Bool ?? true
+        holdEnabled = UserDefaults.standard.object(forKey: "holdEnabled") as? Bool ?? true
 
         statusItem.button?.image = menuBarGlyph()
         applyAppIcon()
@@ -292,6 +365,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         menu.addItem(toggleItem)
+        menu.addItem(holdItem)
         menu.addItem(permItem)
         menu.addItem(.separator())
         menu.addItem(loginItem)
@@ -318,6 +392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         toggleItem.state = tapEnabled ? .on : .off
+        holdItem.state = holdEnabled ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         permItem.isHidden = permissionsOK
     }
@@ -357,8 +432,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleTap() {
         tapEnabled.toggle()
         UserDefaults.standard.set(tapEnabled, forKey: "tapEnabled")
+        if !tapEnabled { endDrag() }
         updateIcon()
     }
+
+    @objc func toggleHold() {
+        holdEnabled.toggle()
+        UserDefaults.standard.set(holdEnabled, forKey: "holdEnabled")
+        if !holdEnabled { endDrag() }
+    }
+
+    func applicationWillTerminate(_ note: Notification) { endDrag() }
 
     @objc func toggleLogin() {
         do {
